@@ -1,0 +1,110 @@
+x-mlops-common:
+  &mlops-common
+  env_file:
+    - .env
+
+services:
+  minio:
+    container_name: mlops-minio
+    <<: *mlops-common
+    profiles: [full, ml]
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY}
+      MINIO_REGION: ${AWS_REGION}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-mlflow:/data
+    networks:
+      - mlops-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  minio-create-bucket:
+    container_name: mlops-minio-config
+    profiles: [full, ml]
+    image: minio/mc
+    depends_on:
+      - minio
+    networks:
+      - mlops-network
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 admin password;
+      mc mb --ignore-existing local/mlflow-artifacts;
+      exit 0;
+      "
+
+  postgres:
+    image: postgres:15
+    profiles: [full, ml]
+    container_name: mlops-postgres
+    environment:
+      POSTGRES_USER: mlops
+      POSTGRES_PASSWORD: mlops123
+      POSTGRES_DB: mlops
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-mlflow:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mlops-network
+
+  mlflow:
+    container_name: mlops-mlflow
+    <<: *mlops-common
+    profiles: [full, ml]
+    build:
+      context: services/mlflow-server
+      dockerfile: Dockerfile
+    working_dir: /mlflow
+    command: >
+      mlflow server 
+      --backend-store-uri postgresql://mlops:mlops123@postgres:5432/mlops 
+      --host 0.0.0.0 
+      --serve-artifacts
+      --artifacts-destination s3://mlflow
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-create-bucket:
+        condition: service_completed_successfully
+    networks:
+      - mlops-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes: 
+  minio-mlflow:
+  postgres-mlflow:
+
+networks:
+  mlops-network:
+    driver: bridge
